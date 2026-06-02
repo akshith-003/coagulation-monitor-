@@ -165,9 +165,29 @@ class _HistoryCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final tc = CoagTheme.getTendencyColor(result.coagTendency);
     final ts = result.timestamp;
-    return GestureDetector(
-      onTap: () => Navigator.push(context,
-          MaterialPageRoute(builder: (_) => _DetailScreen(result: result))),
+    return Dismissible(
+      key: Key(result.id),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        decoration: BoxDecoration(
+          color: CoagTheme.signalPoor,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        child: const Icon(Icons.delete_outline_rounded, color: Colors.white, size: 28),
+      ),
+      onDismissed: (_) {
+        context.read<CoagulationManager>().deleteHistoryItem(result.id);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('${result.id} deleted'),
+          backgroundColor: isDark ? CoagTheme.surfaceDark : CoagTheme.cardLight,
+        ));
+      },
+      child: GestureDetector(
+        onTap: () => Navigator.push(context,
+            MaterialPageRoute(builder: (_) => _DetailScreen(result: result))),
       child: Container(
         margin: const EdgeInsets.only(bottom: 10),
         padding: const EdgeInsets.all(14),
@@ -216,7 +236,7 @@ class _HistoryCard extends StatelessWidget {
           ]),
         ]),
       ),
-    );
+    ));
   }
 }
 
@@ -246,6 +266,31 @@ class _DetailScreen extends StatelessWidget {
         backgroundColor: isDark ? CoagTheme.surfaceDark : Colors.white,
         title: Text(result.id, style: const TextStyle(fontWeight: FontWeight.bold)),
         leading: IconButton(icon: const Icon(Icons.arrow_back_ios_new_rounded), onPressed: () => Navigator.pop(context)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.delete_outline_rounded, color: CoagTheme.signalPoor),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Delete Measurement?', style: TextStyle(fontWeight: FontWeight.bold)),
+                  content: Text('Are you sure you want to delete ${result.id}?'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
+                    TextButton(
+                      onPressed: () {
+                        context.read<CoagulationManager>().deleteHistoryItem(result.id);
+                        Navigator.pop(ctx);
+                        Navigator.pop(context);
+                      },
+                      child: const Text('DELETE', style: TextStyle(color: CoagTheme.signalPoor, fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
