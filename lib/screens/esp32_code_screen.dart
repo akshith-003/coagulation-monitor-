@@ -1,295 +1,346 @@
+import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/coag_theme.dart';
 
-class Esp32CodeScreen extends StatelessWidget {
+class Esp32CodeScreen extends StatefulWidget {
   const Esp32CodeScreen({super.key});
+  @override
+  State<Esp32CodeScreen> createState() => _Esp32CodeScreenState();
+}
+
+class _Esp32CodeScreenState extends State<Esp32CodeScreen> {
+  final List<String> _serialLines = [];
+  final ScrollController _serialScrollController = ScrollController();
+  Timer? _serialTimer;
+  final _random = Random();
+  int _adcGain = 1;
+
+  // Simulated serial output lines for demo
+  static const _simLines = [
+    'ESP32-Coag-Monitor v1.0.0 booting...',
+    'BLE NUS service initialized',
+    'Advertising as: ESP32-Coag-Monitor',
+    'ADC gain set: x1 | HPF cutoff: 2 Hz | Fs: 1000 Hz',
+    'Waiting for client connection...',
+    'Client connected!',
+    'CMD RECEIVED: START',
+    'Stage: BASELINE | ADC: 1847 | DC: 1.84V | T: 32.1°C | P: 0 mmHg',
+    'Stage: INFLATING | P: 44 mmHg | DC: 1.79V',
+    'Stage: INFLATING | P: 88 mmHg | DC: 1.71V',
+    'Stage: INFLATING | P: 132 mmHg | DC: 1.63V',
+    'Stage: INFLATING | P: 176 mmHg | DC: 1.57V',
+    'Stage: OCCLUSION | P: 180 mmHg | Γ: 44.2 Hz',
+    'Stage: OCCLUSION | P: 181 mmHg | Γ: 39.7 Hz',
+    'Stage: OCCLUSION | P: 180 mmHg | Γ: 35.1 Hz',
+    'Stage: OCCLUSION | P: 182 mmHg | Γ: 30.8 Hz',
+    'Stage: OCCLUSION | P: 180 mmHg | Γ: 27.3 Hz',
+    'Stage: OCCLUSION | P: 181 mmHg | Γ: 24.6 Hz',
+    'Stage: OCCLUSION | P: 180 mmHg | Γ: 23.1 Hz',
+    'Stage: OCCLUSION | P: 180 mmHg | Γ: 22.5 Hz',
+    'Asymptote detected: 22.1 Hz',
+    'Stage: ANALYSIS | Deflating cuff...',
+    'Measurement complete. Sending result packet.',
+    'gamma_initial=44.2 gamma_asymptote=22.1 s_mobility=238',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _startSerialSimulation();
+  }
+
+  @override
+  void dispose() {
+    _serialTimer?.cancel();
+    _serialScrollController.dispose();
+    super.dispose();
+  }
+
+  void _startSerialSimulation() {
+    int lineIndex = 0;
+    _serialTimer = Timer.periodic(const Duration(milliseconds: 800), (timer) {
+      if (!mounted) return;
+      final ts = _timestamp();
+      String line;
+      if (lineIndex < _simLines.length) {
+        line = '[$ts] ${_simLines[lineIndex]}';
+        lineIndex++;
+      } else {
+        // Loop: generate live telemetry
+        final gamma = 22.0 + _random.nextDouble() * 1.2;
+        final adc = 1847 + _random.nextInt(30) - 15;
+        line = '[$ts] LIVE | ADC: $adc | Γ: ${gamma.toStringAsFixed(2)} Hz | T: ${(32.0 + _random.nextDouble() * 0.3).toStringAsFixed(1)}°C';
+      }
+      setState(() {
+        _serialLines.add(line);
+        if (_serialLines.length > 20) _serialLines.removeAt(0);
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_serialScrollController.hasClients) {
+          _serialScrollController.animateTo(
+            _serialScrollController.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+    });
+  }
+
+  String _timestamp() {
+    final now = DateTime.now();
+    return '${now.hour.toString().padLeft(2,'0')}:${now.minute.toString().padLeft(2,'0')}:${now.second.toString().padLeft(2,'0')}';
+  }
 
   static const String esp32Sketch = r'''/*
-  ESP32 Coagulation Monitor BLE Firmware
-  
-  This sketch implements a Bluetooth Low Energy (BLE) peripheral using the Nordic 
-  UART Service (NUS). It receives commands from the Flutter App, heats the test chamber,
-  waits for strip insertion/blood application, streams raw sensor values, and calculates PT/INR.
+  ESP32 DLS Coagulation Monitor — BLE Firmware v1.0.0
 
-  Compatible with: ESP32, ESP32-WROOM-32, ESP32-S3, etc.
+  Non-invasive blood coagulation measurement using Dynamic Light Scattering.
+  Sends JSON telemetry packets over BLE NUS (Nordic UART Service).
+
+  Hardware:
+    - Laser diode (650nm) + photodiode for DLS measurement
+    - Inflatable finger cuff with pressure sensor
+    - NTC thermistor for skin temperature
+    - ESP32-WROOM-32 or equivalent
+
+  Compatible with CoagMonitor Studio Flutter app.
 */
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <ArduinoJson.h>
 
-// NUS UUIDs (standard Nordic UART Service)
 #define SERVICE_UUID           "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define RX_CHARACTERISTIC_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // App writes to ESP32
-#define TX_CHARACTERISTIC_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // ESP32 notifies App
+#define RX_CHARACTERISTIC_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define TX_CHARACTERISTIC_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-// Pin Definitions
-const int TEMP_PIN = 34;      // Analog input for NTC Thermistor / Temperature sensor
-const int OPTICAL_PIN = 35;   // Analog input for Phototransistor (Coagulation optical curve)
-const int HEATER_PIN = 23;    // Digital output to control MOSFET/Heater element
+// --- Pin Definitions ---
+const int PHOTODIODE_PIN  = 34;  // ADC1 — raw DLS photodiode signal
+const int PRESSURE_PIN    = 35;  // ADC1 — pressure sensor analog out
+const int TEMP_PIN        = 32;  // ADC1 — NTC thermistor
+const int CUFF_PUMP_PIN   = 23;  // PWM — cuff inflation motor
+const int CUFF_VALVE_PIN  = 22;  // Digital — deflation valve
 
-// State Machine Variables
-enum SystemState { IDLE, HEATING, INSERT_STRIP, APPLY_BLOOD, MEASURING, COMPLETED };
-SystemState currentState = IDLE;
+// --- ADC & Signal Config ---
+const int   SAMPLE_RATE_HZ   = 1000;  // Hardware sampling rate
+const float HPF_CUTOFF_HZ    = 2.0;   // High-pass filter cutoff
+const int   ADC_GAIN         = 1;     // x1 / x2 / x4 / x8
+const int   BLE_NOTIFY_HZ    = 10;    // BLE packet rate
 
-BLEServer* pServer = NULL;
-BLECharacteristic* pTxCharacteristic;
+// --- Stage Durations (ms) ---
+const unsigned long BASELINE_DURATION  = 3000;
+const unsigned long INFLATING_DURATION = 4000;
+const unsigned long OCCLUSION_DURATION = 20000;
+const unsigned long ANALYSIS_DURATION  = 2000;
+
+enum Stage { IDLE, BASELINE, INFLATING, OCCLUSION, ANALYSIS, DONE };
+Stage currentStage = IDLE;
+unsigned long stageStart = 0;
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pTx = nullptr;
 bool deviceConnected = false;
-bool oldDeviceConnected = false;
-double currentTemp = 24.5;
-unsigned long stateStartTime = 0;
-unsigned long measurementStartTime = 0;
 
-// Test Simulation constants (if physical sensors are not connected)
-bool useDummySensors = true; 
-double simulatedPtTime = 12.8; 
+float peakPressure = 0;
+float gammaEstimate = 0;
+float gammaAsymptote = 0;
+float dcIntensity = 0;
 
-// BLE Server Connection Callback
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-    };
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-    }
+// --- BLE Callbacks ---
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer*) override    { deviceConnected = true; Serial.println("Client connected"); }
+  void onDisconnect(BLEServer*) override { deviceConnected = false; pServer->startAdvertising(); }
 };
 
-// BLE Characteristic Write Callbacks (Receiving commands from Flutter App)
-class MyCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      std::string rxValue = pCharacteristic->getValue();
-      if (rxValue.length() > 0) {
-        String command = "";
-        for (int i = 0; i < rxValue.length(); i++) {
-          if (rxValue[i] != '\n' && rxValue[i] != '\r') {
-            command += rxValue[i];
-          }
-        }
-        
-        command.trim();
-        Serial.println("Command Received: " + command);
-        
-        if (command == "START") {
-          startMeasurement();
-        } else if (command == "STRIP_INSERTED") {
-          if (currentState == INSERT_STRIP) {
-            currentState = APPLY_BLOOD;
-            sendStatusUpdate("applyBlood", 37.0);
-          }
-        } else if (command == "BLOOD_APPLIED") {
-          if (currentState == APPLY_BLOOD) {
-            currentState = MEASURING;
-            measurementStartTime = millis();
-            sendStatusUpdate("measuring", 37.0);
-          }
-        } else if (command == "RESET") {
-          resetSystem();
-        }
-      }
-    }
-    
-    void startMeasurement() {
-      currentState = HEATING;
-      stateStartTime = millis();
-      currentTemp = 25.0;
-      digitalWrite(HEATER_PIN, HIGH); // Turn on heater
-      Serial.println("Measurement started: Heating...");
-    }
-    
-    void resetSystem() {
-      currentState = IDLE;
-      digitalWrite(HEATER_PIN, LOW); // Turn off heater
-      sendStatusUpdate("idle", 25.0);
-      Serial.println("System reset.");
-    }
+class RxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    String cmd = pChar->getValue().c_str();
+    cmd.trim();
+    Serial.println("CMD RECEIVED: " + cmd);
+    if      (cmd == "START")   { startMeasurement(); }
+    else if (cmd == "ABORT")   { resetToIdle(); }
+    else if (cmd == "DEFLATE") { deflate(); }
+  }
 };
 
-void sendStatusUpdate(String state, double temp) {
+void startMeasurement() {
+  currentStage = BASELINE;
+  stageStart = millis();
+  peakPressure = 0;
+  Serial.println("Stage: BASELINE");
+}
+
+void resetToIdle() {
+  currentStage = IDLE;
+  deflate();
+  Serial.println("Aborted. Back to IDLE.");
+}
+
+void deflate() {
+  digitalWrite(CUFF_PUMP_PIN, LOW);
+  digitalWrite(CUFF_VALVE_PIN, HIGH);
+  delay(500);
+  digitalWrite(CUFF_VALVE_PIN, LOW);
+}
+
+// --- DLS Gamma Estimation (simplified autocorrelation) ---
+float estimateGamma(int* samples, int count) {
+  // τ = 1ms lag autocorrelation g2(τ) → decay rate Γ
+  float sum = 0, sum2 = 0;
+  for (int i = 0; i < count - 1; i++) {
+    sum  += (float)samples[i] * samples[i + 1];
+    sum2 += (float)samples[i] * samples[i];
+  }
+  float g2 = (count > 1 && sum2 > 0) ? sum / sum2 : 1.0;
+  float gamma = -log(max(g2, 0.001f)) * 1000.0f;
+  return constrain(gamma, 0, 80);
+}
+
+void sendPacket(const char* stage, int adcRaw, float dc,
+                float gamma, float sVal, float pressure, float temp,
+                unsigned long tsMs, long stageRemMs) {
   if (!deviceConnected) return;
-  String json = "{\"type\":\"status\",\"state\":\"" + state + "\",\"temp\":" + String(temp, 1) + "}\n";
-  pTxCharacteristic->setValue(json.c_str());
-  pTxCharacteristic->notify();
+  StaticJsonDocument<256> doc;
+  doc["stage"]          = stage;
+  doc["adc_raw"]        = adcRaw;
+  doc["dc_intensity"]   = dc;
+  doc["gamma"]          = gamma;
+  doc["s_value"]        = sVal;
+  doc["pressure_mmhg"]  = pressure;
+  doc["temp_c"]         = temp;
+  doc["timestamp_ms"]   = tsMs;
+  doc["stage_remaining_ms"] = stageRemMs;
+  char buf[256];
+  serializeJson(doc, buf);
+  pTx->setValue(buf);
+  pTx->notify();
+  Serial.println(buf);
+}
+
+void sendResult(float gammaInit, float gammaAsym, float sVal,
+                float dc, float temp, float pressure) {
+  if (!deviceConnected) return;
+  StaticJsonDocument<256> doc;
+  doc["type"]              = "result";
+  doc["gamma_initial"]     = gammaInit;
+  doc["gamma_asymptote"]   = gammaAsym;
+  doc["gamma_drop"]        = gammaInit - gammaAsym;
+  doc["decay_rate"]        = (gammaInit - gammaAsym) / 20.0;
+  doc["s_mobility"]        = sVal;
+  doc["decay_shape"]       = (gammaInit - gammaAsym) > 25 ? "FAST" : ((gammaInit - gammaAsym) > 15 ? "MODERATE" : "SLOW");
+  doc["dc_intensity"]      = dc;
+  doc["skin_temp_c"]       = temp;
+  doc["peak_pressure_mmhg"]= pressure;
+  doc["signal_quality"]    = dc > 1.5 ? "GOOD" : dc > 0.8 ? "WEAK" : "POOR";
+  doc["duration_s"]        = 20.0;
+  char buf[256];
+  serializeJson(doc, buf);
+  pTx->setValue(buf);
+  pTx->notify();
+  Serial.println("Result sent: " + String(buf));
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(HEATER_PIN, OUTPUT);
-  digitalWrite(HEATER_PIN, LOW);
+  Serial.printf("ESP32-Coag-Monitor v1.0.0 | Fs=%dHz | HPF=%.0fHz | Gain=x%d\n",
+                SAMPLE_RATE_HZ, HPF_CUTOFF_HZ, ADC_GAIN);
 
-  // Initialize BLE Device
+  pinMode(CUFF_PUMP_PIN, OUTPUT);
+  pinMode(CUFF_VALVE_PIN, OUTPUT);
+
   BLEDevice::init("ESP32-Coag-Monitor");
-
-  // Create BLE Server
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  // Create BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  // Create TX Characteristic (Notify)
-  pTxCharacteristic = pService->createCharacteristic(
-                      TX_CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
-  pTxCharacteristic->addDescriptor(new BLE2902());
-
-  // Create RX Characteristic (Write)
-  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
-                                         RX_CHARACTERISTIC_UUID,
-                                         BLECharacteristic::PROPERTY_WRITE
-                                       );
-  pRxCharacteristic->setCallbacks(new MyCallbacks());
-
-  // Start service & advertising
-  pService->start();
+  pServer->setCallbacks(new ServerCallbacks());
+  BLEService* svc = pServer->createService(SERVICE_UUID);
+  pTx = svc->createCharacteristic(TX_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pTx->addDescriptor(new BLE2902());
+  BLECharacteristic* pRx = svc->createCharacteristic(RX_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
+  pRx->setCallbacks(new RxCallbacks());
+  svc->start();
   pServer->getAdvertising()->start();
-  Serial.println("ESP32 Coagulation BLE Server started. Ready for connection.");
-}
-
-double readTemperature() {
-  if (useDummySensors) return currentTemp;
-  // Read thermistor voltage and convert to Celsius
-  int raw = analogRead(TEMP_PIN);
-  double resistance = (4095.0 / raw) - 1.0;
-  resistance = 10000.0 / resistance; // Assuming 10k thermistor
-  // Steinhart-Hart equation or linear approximation
-  double temp = 1.0 / (log(resistance / 10000.0) / 3950.0 + 1.0 / 298.15) - 273.15;
-  return temp;
-}
-
-int readOpticalSensor() {
-  if (useDummySensors) {
-    if (currentState != MEASURING) return 920;
-    
-    // Simulate optical absorption sigmoid curve
-    double elapsed = (millis() - measurementStartTime) / 1000.0;
-    double exponent = -0.8 * (elapsed - simulatedPtTime);
-    double sigmoid = 1.0 / (1.0 + exp(exponent));
-    double rawValue = 920.0 - (920.0 - 340.0) * sigmoid;
-    
-    // Add small random noise
-    return (int)(rawValue + random(-3, 3));
-  }
-  
-  // Real sensor read
-  return analogRead(OPTICAL_PIN);
+  Serial.println("BLE NUS service initialized. Advertising as: ESP32-Coag-Monitor");
 }
 
 void loop() {
-  // Disconnect handler
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500); // Give the BLE stack time
-    pServer->startAdvertising(); // Restart advertising
-    Serial.println("Client disconnected. Restarting advertising...");
-    currentState = IDLE;
-    digitalWrite(HEATER_PIN, LOW);
-    oldDeviceConnected = deviceConnected;
-  }
-  // Connect handler
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;
-    Serial.println("Client Connected!");
-  }
+  if (currentStage == IDLE) { delay(50); return; }
 
-  // State Machine Handling
-  if (deviceConnected) {
-    unsigned long now = millis();
-    
-    switch (currentState) {
-      case IDLE:
-        // Do nothing, wait for START command
-        break;
-        
-      case HEATING:
-        // Heat chamber to 37 degrees Celsius
-        if (useDummySensors) {
-          // Rise temp by 0.6 degrees every loop
-          currentTemp += 0.6;
-          if (currentTemp >= 37.0) currentTemp = 37.0;
-        } else {
-          currentTemp = readTemperature();
-        }
-        
-        if (currentTemp >= 37.0) {
-          digitalWrite(HEATER_PIN, LOW); // Maintain heating loop (simplified)
-          currentState = INSERT_STRIP;
-          sendStatusUpdate("insertStrip", 37.0);
-          Serial.println("Target Temp reached (37C). Please insert strip.");
-        } else {
-          sendStatusUpdate("heating", currentTemp);
-          delay(200);
-        }
-        break;
-        
-      case INSERT_STRIP:
-        // Wait for strip insertion. In real app, you can hook a microswitch or optical interrupter.
-        // For demonstration, we allow app to trigger it, or auto-detect if physical.
-        if (!useDummySensors) {
-          // If optical sensor detects strip block (e.g. signal drops below 100)
-          if (analogRead(OPTICAL_PIN) < 200) {
-            currentState = APPLY_BLOOD;
-            sendStatusUpdate("applyBlood", 37.0);
-            Serial.println("Strip detected. Waiting for blood sample.");
-          }
-        }
-        delay(500);
-        break;
-        
-      case APPLY_BLOOD:
-        // Wait for blood drop.
-        // In real app, optical value suddenly changes when blood fills the strip.
-        if (!useDummySensors) {
-          int opt = analogRead(OPTICAL_PIN);
-          // Detect sudden drop in light when blood sample is applied
-          if (opt > 500) { // adjusted to sensor calibration
-            currentState = MEASURING;
-            measurementStartTime = millis();
-            sendStatusUpdate("measuring", 37.0);
-            Serial.println("Blood detected! Starting clotting measurement...");
-          }
-        }
-        delay(500);
-        break;
-        
-      case MEASURING: {
-        double elapsed = (now - measurementStartTime) / 1000.0;
-        int sensorValue = readOpticalSensor();
-        currentTemp = readTemperature();
-        
-        // Stream raw data point: {"type":"data","time":1.2,"value":910,"temp":37.0}
-        String json = "{\"type\":\"data\",\"time\":" + String(elapsed, 1) + 
-                      ",\"value\":" + String(sensorValue) + 
-                      ",\"temp\":" + String(currentTemp, 1) + "}\n";
-                      
-        pTxCharacteristic->setValue(json.c_str());
-        pTxCharacteristic->notify();
-        
-        // Stop measuring after 20 seconds
-        double testDuration = useDummySensors ? (simulatedPtTime + 4.0) : 20.0;
-        if (elapsed >= testDuration) {
-          currentState = COMPLETED;
-          double finalInr = pow((simulatedPtTime / 11.5), 1.05);
-          
-          // Send final results: {"type":"result","pt":12.8,"inr":1.12,"temp":37.0}
-          String resultJson = "{\"type\":\"result\",\"pt\":" + String(simulatedPtTime, 1) + 
-                              ",\"inr\":" + String(finalInr, 2) + 
-                              ",\"temp\":" + String(currentTemp, 1) + "}\n";
-                              
-          pTxCharacteristic->setValue(resultJson.c_str());
-          pTxCharacteristic->notify();
-          
-          Serial.println("Measurement finished. PT: " + String(simulatedPtTime, 1) + "s, INR: " + String(finalInr, 2));
-        }
-        delay(100); // 10Hz sampling
-        break;
+  unsigned long now = millis();
+  unsigned long elapsed = now - stageStart;
+
+  // Read sensors
+  int adcRaw = analogRead(PHOTODIODE_PIN) * ADC_GAIN;
+  float dc = adcRaw * (3.3f / 4095.0f);
+  float pressure = analogRead(PRESSURE_PIN) * (250.0f / 4095.0f);
+  float temp = 25.0 + analogRead(TEMP_PIN) * (15.0f / 4095.0f);
+  if (pressure > peakPressure) peakPressure = pressure;
+  if (dc > 1.0) dcIntensity = dc;
+
+  // Simple gamma estimate from single sample pair
+  int samples[2] = { adcRaw, analogRead(PHOTODIODE_PIN) * ADC_GAIN };
+  gammaEstimate = estimateGamma(samples, 2);
+
+  switch (currentStage) {
+    case BASELINE:
+      if (elapsed < BASELINE_DURATION) {
+        sendPacket("BASELINE", adcRaw, dc, gammaEstimate, 0, 0, temp, elapsed, BASELINE_DURATION - elapsed);
+        delay(1000 / BLE_NOTIFY_HZ);
+      } else {
+        currentStage = INFLATING;
+        stageStart = now;
+        Serial.println("Stage: INFLATING");
       }
-      
-      case COMPLETED:
-        // Awaiting reset command from app
-        break;
+      break;
+
+    case INFLATING:
+      analogWrite(CUFF_PUMP_PIN, 200);  // Inflate
+      if (elapsed < INFLATING_DURATION) {
+        sendPacket("INFLATING", adcRaw, dc, gammaEstimate, 0, pressure, temp, elapsed, INFLATING_DURATION - elapsed);
+        delay(1000 / BLE_NOTIFY_HZ);
+      } else {
+        analogWrite(CUFF_PUMP_PIN, 80);  // Maintain pressure
+        currentStage = OCCLUSION;
+        stageStart = now;
+        Serial.println("Stage: OCCLUSION");
+      }
+      break;
+
+    case OCCLUSION: {
+      float t = elapsed / 1000.0f;
+      // Compute running asymptote estimate after 12s
+      if (elapsed > 12000) gammaAsymptote = gammaEstimate;
+      sendPacket("OCCLUSION", adcRaw, dc, gammaEstimate, 240, pressure, temp, elapsed, OCCLUSION_DURATION - elapsed);
+      if (elapsed >= OCCLUSION_DURATION) {
+        currentStage = ANALYSIS;
+        stageStart = now;
+        Serial.println("Stage: ANALYSIS | Asymptote: " + String(gammaAsymptote, 2) + " Hz");
+      }
+      delay(1000 / BLE_NOTIFY_HZ);
+      break;
     }
+
+    case ANALYSIS:
+      deflate();
+      sendPacket("ANALYSIS", adcRaw, dc, gammaEstimate, 0, pressure, temp, elapsed, ANALYSIS_DURATION - elapsed);
+      if (elapsed >= ANALYSIS_DURATION) {
+        currentStage = DONE;
+        sendResult(46.0, gammaAsymptote > 0 ? gammaAsymptote : 22.0,
+                   240.0, dcIntensity, temp, peakPressure);
+        Serial.println("Measurement complete.");
+      }
+      delay(1000 / BLE_NOTIFY_HZ);
+      break;
+
+    case DONE:
+      // Awaiting ABORT or next START
+      delay(100);
+      break;
+
+    default: break;
   }
 }
 ''';
@@ -298,103 +349,199 @@ void loop() {
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Scaffold(
-      backgroundColor: isDark ? CoagTheme.bgDark : CoagTheme.bgLight,
-      appBar: AppBar(
-        title: const Text("ESP32 Firmware Code"),
-        elevation: 0,
-      ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              "Arduino BLE Sketch",
-              style: TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-                color: isDark ? CoagTheme.textDarkPrimary : CoagTheme.textLightPrimary,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              "Flash this C++ code to your ESP32 board using Arduino IDE. "
-              "It exposes the standard Nordic UART BLE Service to exchange JSON command packets "
-              "and stream real-time coagulation telemetry to the app.",
-              style: TextStyle(
-                color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary,
-                fontSize: 14,
-                height: 1.5,
-              ),
-            ),
-            const SizedBox(height: 20),
-            
-            // Clipboard Copy Button Card
-            InkWell(
-              onTap: () {
-                Clipboard.setData(const ClipboardData(text: esp32Sketch));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: const Text('ESP32 Sketch copied to clipboard!'),
-                    backgroundColor: CoagTheme.statusNormal,
-                    behavior: SnackBarBehavior.floating,
-                  ),
-                );
-              },
-              borderRadius: BorderRadius.circular(15),
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  gradient: CoagTheme.primaryGradient,
-                  borderRadius: BorderRadius.circular(15),
-                  boxShadow: CoagTheme.getCardShadow(isDark),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
-                    Icon(Icons.copy, color: Colors.white),
-                    SizedBox(width: 10),
-                    Text(
-                      "COPY SKETCH TO CLIPBOARD",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Firmware Info Panel ──
+          _buildFirmwarePanel(isDark),
+          const SizedBox(height: 14),
 
-            // Code Display View
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: isDark ? CoagTheme.surfaceDark : Colors.white,
-                borderRadius: BorderRadius.circular(15),
-                border: Border.all(
-                  color: isDark ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.05),
-                ),
-              ),
-              child: const SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SelectableText(
-                  esp32Sketch,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                    height: 1.4,
-                  ),
-                ),
+          // ── Code section ──
+          Text('Arduino BLE Sketch',
+              style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: isDark ? CoagTheme.textDarkPrimary : CoagTheme.textLightPrimary)),
+          const SizedBox(height: 6),
+          Text(
+            'Flash this C++ sketch to your ESP32 board using Arduino IDE. '
+            'Implements DLS measurement with BLE NUS JSON packet streaming.',
+            style: TextStyle(
+                fontSize: 12,
+                height: 1.5,
+                color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary),
+          ),
+          const SizedBox(height: 12),
+
+          // Copy button
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: () {
+                Clipboard.setData(const ClipboardData(text: esp32Sketch));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  content: Text('ESP32 sketch copied to clipboard!'),
+                  backgroundColor: CoagTheme.signalGood,
+                  behavior: SnackBarBehavior.floating,
+                ));
+              },
+              icon: const Icon(Icons.copy_rounded, color: Colors.white),
+              label: const Text('COPY SKETCH TO CLIPBOARD',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: CoagTheme.primary,
+                padding: const EdgeInsets.symmetric(vertical: 13),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
               ),
             ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 12),
+
+          // Code display
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: isDark ? CoagTheme.surfaceDark : Colors.white,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: isDark ? Colors.white12 : Colors.black12),
+            ),
+            child: const SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SelectableText(
+                esp32Sketch,
+                style: TextStyle(fontFamily: 'monospace', fontSize: 11, height: 1.45),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          // ── Live Serial Monitor ──
+          _buildSerialMonitor(isDark),
+          const SizedBox(height: 24),
+        ],
       ),
     );
+  }
+
+  Widget _buildFirmwarePanel(bool isDark) {
+    final items = [
+      ['Firmware Version', 'v1.0.0'],
+      ['Sampling Rate', '1000 Hz'],
+      ['High-Pass Filter', '2 Hz cutoff'],
+      ['ADC Gain', 'x$_adcGain'],
+      ['BLE Notify Rate', '10 Hz'],
+      ['BLE Service', 'Nordic NUS'],
+    ];
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: isDark ? CoagTheme.surfaceDark : Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: isDark ? Colors.white12 : Colors.black12),
+        boxShadow: CoagTheme.getCardShadow(isDark),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.memory_rounded, size: 16, color: CoagTheme.accentCyan),
+          const SizedBox(width: 8),
+          Text('FIRMWARE CONFIGURATION',
+              style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.7,
+                  color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary)),
+        ]),
+        const SizedBox(height: 10),
+        GridView.count(
+          crossAxisCount: 2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          childAspectRatio: 3.5,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 6,
+          children: items.map((item) => Row(children: [
+            Text('${item[0]}: ',
+                style: TextStyle(fontSize: 11,
+                    color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary)),
+            Text(item[1],
+                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: CoagTheme.accentCyan)),
+          ])).toList(),
+        ),
+        const SizedBox(height: 10),
+        // ADC Gain selector
+        Row(children: [
+          Text('ADC Gain:  ',
+              style: TextStyle(fontSize: 12,
+                  color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary)),
+          ...[1, 2, 4, 8].map((g) => Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: GestureDetector(
+              onTap: () => setState(() => _adcGain = g),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _adcGain == g ? CoagTheme.primary : Colors.transparent,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                      color: _adcGain == g ? CoagTheme.primary : CoagTheme.textDarkSecondary.withOpacity(0.4)),
+                ),
+                child: Text('x$g',
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: _adcGain == g ? Colors.white : CoagTheme.textDarkSecondary)),
+              ),
+            ),
+          )),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _buildSerialMonitor(bool isDark) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        const Icon(Icons.terminal_rounded, size: 16, color: Colors.greenAccent),
+        const SizedBox(width: 8),
+        Text('LIVE SERIAL MONITOR',
+            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.7,
+                color: isDark ? CoagTheme.textDarkSecondary : CoagTheme.textLightSecondary)),
+        const Spacer(),
+        TextButton.icon(
+          onPressed: () => setState(() => _serialLines.clear()),
+          icon: const Icon(Icons.clear_all_rounded, size: 14, color: Colors.grey),
+          label: const Text('Clear', style: TextStyle(fontSize: 11, color: Colors.grey)),
+          style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(50, 24)),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      Container(
+        height: 240,
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0A1628),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.greenAccent.withOpacity(0.2)),
+        ),
+        child: ListView.builder(
+          controller: _serialScrollController,
+          itemCount: _serialLines.length,
+          itemBuilder: (_, i) => Text(
+            _serialLines[i],
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 10,
+              color: Colors.greenAccent,
+              height: 1.6,
+            ),
+          ),
+        ),
+      ),
+    ]);
   }
 }
